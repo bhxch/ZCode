@@ -177,6 +177,48 @@ CLI 模型请求不带 `X-Device-Mid`；该头只出现在 electron/off-peak tic
 
 ---
 
+## 5.1 补充：provider-native WebSearch 支持矩阵（2026-10-16 追加）
+
+`webSearch_20260209`（Anthropic server tool）的启用是"模型能力声明 + provider kind"双门（`tool-transform.ts:245-279`、`core/src/tool/handlers/websearch.ts`）：
+
+1. 编码门：仅 `providerKind === "anthropic"`；openai/openai-compatible 直接抛 `InvalidModelRequest`。参数 `maxUses` 默认 8，可带 `allowedDomains`/`blockedDomains`。
+2. 能力门：`model.properties.supportsNativeWebSearch`（zcode-builtin.json `providerSiteRules` 声明），不满足时 WebSearch **直接不进 toolset**（`runtime/methods/config.ts:282-287`），硬调报 `ConfigurationError`。fallback 明确为 `"disabled"`，**无自实现降级**。
+
+站点声明矩阵（`config/provider/zcode-builtin.json` providerSiteRules）：
+
+| baseURL | supportsNativeWebSearch |
+| --- | --- |
+| `api.anthropic.com/v1`（仅 `claude-*` 模型） | true |
+| `api.deepseek.com/anthropic` | true |
+| `api.z.ai/api/anthropic`（zai coding-plan individual） | true |
+| `open.bigmodel.cn/api/anthropic`（bigmodel coding-plan individual/team） | true |
+| `zcode.z.ai/api/v1/zcode-plan/anthropic`（start-plan） | true |
+| `zcode.z.ai/api/v1/highspeed/anthropic`（highspeed） | true |
+| `zcode.z.ai/api/v1/off-peak/anthropic`（off-peak） | **显式 false**（另有 `supportsMidConversationSystem: true`） |
+
+结论：coding-plan 套餐（individual/team/start-plan）与 highspeed 均支持；**仅 off-peak 闲时不支持**。
+
+BigModel 网关的两个专门适配（`websearch.ts:93-112` 注释，说明该路径实际在用）：
+
+- BigModel Anthropic 兼容端点拒绝 named forced `tool_choice`（错误码 1210）→ WebSearch 内部调用保持 auto choice，靠单工具 + prompt 触发搜索。
+- BigModel 非流式响应会把 provider 内部 web_search 结果返回为 assistant 侧裸 `tool_result`，AI SDK schema 校验会抛 Invalid JSON → **强制走流式**复用 SSE compat。
+
+WebSearch handler 内部再发一次模型请求：`streamText`，system 固定 `"You are an assistant for performing a web search tool use."`，user 为 `Perform a web search for the query: …`，`maxOutputTokens = min(4096, model max)`，最低 reasoning 档位（auxiliaryModelOptions）。
+
+## 5.2 补充：哪些工具内部会二次调 LLM（sidecar 请求）
+
+全仓核实（grep `generateText|streamText`），core 工具 handler 中内部再调模型请求的只有 3 个，加上 Agent/Task/Workflow 三类"再跑一个会话"：
+
+| 工具 | 内部调用 | 参数差异 |
+| --- | --- | --- |
+| `WebSearch` | streamText（强制流式，见 5.1） | 4096 上限、最低档、单 provider-native 工具 |
+| `WebFetch` | generateText（`webfetch-processing.ts`） | 4096 上限、最低档；markdown 预批准内容直返不调模型 |
+| `ReadSessionContext` | generateText（`read-session-context.ts`） | `min(用户 maxTokens, 上限, model max)`、最低档；旧 transcript 标注为不可信数据 |
+| `Agent`/`Task` | 启动完整子 AgentRuntime | 同主 turn 参数 |
+| `CreateWorkflow` 等工作流工具 | 启动 workflow run（多 actor 会话） | 同主 turn 参数 |
+
+其余全部内置工具（Read/Write/Edit/Bash/Glob/Grep、Todo*、Cron*、OffPeak*、PlanMode、AskUserQuestion、SendMessage、Skill、ListModels、workflow 状态类等）均为纯本地执行，不产生额外模型请求。没有名为 "Memory" 的工具：memory 系统由 turn 开始的 recall（manifest 扫描 + 辅助 LLM selector 选 ≤5 个记忆文件注入）、turn 结束的 extraction（memory agent loop，工具收窄为只读 + memory 目录内写入）和 dream 整合（24h 节流，core 生产链路未接线）组成，全部借用通用文件工具。
+
 ## 6. 关键文件索引
 
 - 工厂/kind 映射：`apps/zcode-cli/packages/adapters/src/model/model-execution.ts`
